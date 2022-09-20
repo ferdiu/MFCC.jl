@@ -11,14 +11,14 @@ export feasave, feaload, feasize
 export feacalc
 
 using DSP
-using HDF5
+# using HDF5
 using WAV
 using SpecialFunctions ## erfinv
-using Statistics  
+using Statistics
 
 include("rasta.jl")
 include("mfccs.jl")
 include("feacalc.jl")
-include("io.jl")
+# include("io.jl")
 
 end
