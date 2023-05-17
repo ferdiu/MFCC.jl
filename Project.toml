@@ -1,7 +1,7 @@
 name = "MFCC"
 uuid = "ca7b5df7-6146-5dcc-89ec-36256279a339"
 authors = ["David van Leeuwen"]
-version = "0.3.2"
+version = "0.3.3"
 
 [deps]
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
@@ -9,13 +9,18 @@ Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 FileIO = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-Memoize = "c03570c3-d221-55d1-a50c-7939bbd78826"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 WAV = "8149f6b0-98f6-5db9-b78f-408fbbb8ef88"
 
 [compat]
-julia = "≥ 0.7.0"
+julia = "1"
+DSP = "0.6, 0.7"
+FFTW = "1"
+FileIO = "1"
+#HDF5 = "0.12, 0.13, 0.14, 0.15, 0.16"
+SpecialFunctions = "0.8, 1, 2"
+WAV = "1"
 
 [extras]
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
