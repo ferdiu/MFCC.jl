@@ -71,7 +71,7 @@ function fft2barkmx(nfft::Int, nfilts::Int; sr=8000.0, width=1.0, minfreq=0., ma
     return wts
 end
 
-## Hynek's formula   
+## Hynek's formula
 hz2bark(f) = 6 * asinh(f / 600)
 bark2hz(bark) = 600 * sinh(bark / 6)
 
@@ -145,11 +145,11 @@ function postaud(x::Matrix{T}, fmax::Real, fbtype=:bark, broaden=false) where {T
     (nbands,nframes) = size(x)
     nfpts = nbands + 2broaden
     if fbtype == :bark
-        bandcfhz = bark2hz.(range(0, hz2bark(fmax), length=nfpts))
+        bandcfhz = bark2hz(range(0, stop=hz2bark(fmax), length=nfpts))
     elseif fbtype == :mel
-        bandcfhz = mel2hz(range(0, hz2mel(fmax), length=nfpts))
+        bandcfhz = mel2hz(range(0, stop=hz2mel(fmax), length=nfpts))
     elseif fbtype == :htkmel || fbtype == :fcmel
-        bandcfhz = mel2hz(range(0, hz2mel(fmax,1), length=nfpts),1);
+        bandcfhz = mel2hz(range(0, stop=hz2mel(fmax,1), length=nfpts),1);
     else
         error("Unknown filterbank type")
     end

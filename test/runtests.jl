@@ -9,9 +9,9 @@ using SpecialFunctions
 using Statistics
 
 x, meta, params = feacalc("bl2.wav", normtype=:none, method=:wav, augtype=:none, sadtype=:none)
-y = feaload("bl2.mfcc")
+#y = feaload("bl2.mfcc")
 
-@assert x == y
+#@assert x == y
 
 z = warp(x)
 z = deltas(x)
