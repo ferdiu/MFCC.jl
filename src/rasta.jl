@@ -11,62 +11,63 @@
 using DSP
 using FFTW
 using LinearAlgebra
+using Memoization
 
-function powspec(x::Vector{T}, sr::Real=8000.0; wintime=0.025, steptime=0.01, dither=true) where {T<:AbstractFloat}
+function powspec(x::AbstractVector{<:AbstractFloat}, sr::Real=8000.0;
+                 wintime::Real=0.025, steptime::Real=0.01, dither::Real=true)
     nwin = round(Integer, wintime * sr)
     nstep = round(Integer, steptime * sr)
 
-    nfft = 2 .^ Integer((ceil(log2(nwin))))
+    nfft = nextpow(2, nwin)
     window = hamming(nwin)      # overrule default in specgram which is hanning in Octave
     noverlap = nwin - nstep
 
     y = spectrogram(x .* (1<<15), nwin, noverlap, nfft=nfft, fs=sr, window=window, onesided=true).power
-    ## for compability with previous specgram method, remove the last frequency and scale
-    y = y[1:end-1, :] ##  * sumabs2(window) * sr / 2
+    ## for compatibility with previous specgram method, remove the last frequency and scale
+    y = y[begin:end-1, :]   ##  * sumabs2(window) * sr / 2
     y .+= dither * nwin / (sum(abs2, window) * sr / 2) ## OK with julia 0.5, 0.6 interpretation as broadcast!
 
     return y
 end
 
 # audspec tested against octave with simple vectors for all fbtypes
-function audspec(x::Matrix{T}, sr::Real=16000.0; nfilts=ceil(Int, hz2bark(sr/2)), fbtype=:bark,
-                 minfreq=0., maxfreq=sr/2, sumpower=true, bwidth=1.0) where {T<:AbstractFloat}
+function audspec(x::AbstractMatrix{<:AbstractFloat}, sr::Real=16000.0;
+                 nfilts=ceil(Int, hz2bark(sr / 2)), fbtype=:bark, sumpower::Bool=true, args...)
     nfreqs, nframes = size(x)
     nfft = 2(nfreqs-1)
-    if fbtype == :bark
-        wts = fft2barkmx(nfft, nfilts, sr=sr, width=bwidth, minfreq=minfreq, maxfreq=maxfreq)
+    wts = if fbtype == :bark
+        fft2barkmx(nfft, nfilts; sr=sr, args...)
     elseif fbtype == :mel
-        wts = fft2melmx(nfft, nfilts, sr=sr, width=bwidth, minfreq=minfreq, maxfreq=maxfreq)
+        fft2melmx(nfft, nfilts; sr=sr, args...)
     elseif fbtype == :htkmel
-        wts = fft2melmx(nfft, nfilts, sr=sr, width=bwidth, minfreq=minfreq, maxfreq=maxfreq,
-                        htkmel=true, constamp=true)
+        fft2melmx(nfft, nfilts; sr=sr, htkmel=true, constamp=true, args...)
     elseif fbtype == :fcmel
-        wts = fft2melmx(nfft, nfilts, sr=sr, width=bwidth, minfreq=minfreq, maxfreq=maxfreq,
-                        htkmel=true, constamp=false)
+        fft2melmx(nfft, nfilts; sr=sr, htkmel=true, constamp=false, args...)
     else
-        error("Unknown filterbank type ", fbtype)
+        throw(ArgumentError(string("Unknown filterbank type ", fbtype)))
     end
-    wts = wts[:, 1:nfreqs]
+    wts_v = view(wts, :, 1:nfreqs)
     if sumpower
-        return wts * x
+        return wts_v * x
     else
-        return (wts * sqrt.(x)).^2
+        aspec = wts_v * sqrt.(x)
+        return map!(x->x^2, aspec, aspec)
     end
 end
 
-function fft2barkmx(nfft::Int, nfilts::Int; sr=8000.0, width=1.0, minfreq=0., maxfreq=sr/2)
+@memoize function fft2barkmx(nfft::Integer, nfilts::Integer; sr=8000.0, bwidth=1.0, minfreq=0., maxfreq=sr/2)
     hnfft = nfft >> 1
     minbark = hz2bark(minfreq)
     nyqbark = hz2bark(maxfreq) - minbark
     wts = zeros(nfilts, nfft)
     stepbark = nyqbark / (nfilts-1)
     binbarks = hz2bark.((0:hnfft) * sr / nfft)
-    for i in 1:nfilts
+    for i in axes(wts, 1), j in eachindex(binbarks)
         midbark = minbark + (i-1) * stepbark
-        lof = (binbarks .- midbark) / width .- 0.5
-        hif = (binbarks .- midbark) / width .+ 0.5
-        logwts = min.(0, hif, -2.5lof)
-        wts[i, 1:1+hnfft] = 10.0.^logwts
+        mf = (binbarks[j] - midbark) / bwidth
+        lof, hif = mf - 0.5, mf + 0.5
+        logwt = min(0, hif, -2.5lof)
+        wts[i, j] = exp10(logwt)
     end
     return wts
 end
@@ -75,256 +76,265 @@ end
 hz2bark(f) = 6 * asinh(f / 600)
 bark2hz(bark) = 600 * sinh(bark / 6)
 
-function fft2melmx(nfft::Int, nfilts::Int; sr=8000.0, width=1.0, minfreq=0.0, maxfreq=sr/2, htkmel=false, constamp=false)
+function slope_gen(fs, fftfreq)
+    f1, f2, f3 = fs
+    # lower and upper slopes for all bins
+    loslope = (fftfreq - f1) / (f2 - f1)
+    hislope = (f3 - fftfreq) / (f3 - f2)
+    # then intersect them with each other and zero
+    max(0, min(loslope, hislope))
+end
+
+@memoize function fft2melmx(nfft::Integer, nfilts::Integer; sr=8000.0, bwidth=1.0, minfreq=0.0,
+                   maxfreq=sr/2, htkmel::Bool=false, constamp::Bool=false)
     wts = zeros(nfilts, nfft)
+    lastind = (nfft>>1)
     # Center freqs of each DFT bin
-    fftfreqs = collect(0:nfft-1) / nfft * sr;
+    fftfreqs = collect((0:lastind-1) / nfft * sr);
     # 'Center freqs' of mel bands - uniformly spaced between limits
     minmel = hz2mel(minfreq, htkmel);
     maxmel = hz2mel(maxfreq, htkmel);
-    binfreqs = mel2hz(minmel .+ collect(0:(nfilts+1)) / (nfilts + 1) * (maxmel - minmel), htkmel);
+    binfreqs = @. mel2hz(minmel + (0:(nfilts+1)) / (nfilts + 1) * (maxmel - minmel), htkmel);
 ##    binbin = iround(binfrqs/sr*(nfft-1));
 
-    for i in 1:nfilts
-        fs = binfreqs[i .+ (0:2)]
+    for i in axes(wts, 1)
+        fs = binfreqs[i], binfreqs[i+1], binfreqs[i+2]
         # scale by width
-        fs = fs[2] .+ (fs .- fs[2])width
-        # lower and upper slopes for all bins
-        loslope = (fftfreqs .- fs[1]) / (fs[2] - fs[1])
-        hislope = (fs[3] .- fftfreqs) / (fs[3] - fs[2])
-        # then intersect them with each other and zero
-        wts[i,:] = max.(0, min.(loslope, hislope))
+        fs = @. fs[2] + (fs - fs[2])bwidth
+        for j in eachindex(fftfreqs)
+            wts[i, j] = slope_gen(fs, fftfreqs[j])
+        end
     end
 
     if !constamp
         ## unclear what this does...
         ## Slaney-style mel is scaled to be approx constant E per channel
-        wts = broadcast(*, 2 ./ ((binfreqs[3:nfilts+2]) - binfreqs[1:nfilts]), wts)
+        @. wts = 2 / ((binfreqs[3:end]) - binfreqs[1:nfilts]) * wts
+        # Make sure 2nd half of DFT is zero
+        wts[:, begin+lastind:end] .= 0.
     end
-    # Make sure 2nd half of DFT is zero
-    wts[:, (nfft>>1)+1:nfft] .= 0.
     return wts
 end
 
-function hz2mel(f::Vector{T}, htk=false) where {T<:AbstractFloat}
+function hz2mel(f::AbstractFloat, htk::Bool=false)
     if htk
-        return 2595 .* log10.(1 .+ f / 700)
+        return 2595 * log10(1 + f / 700)
     else
         f0 = 0.0
         fsp = 200 / 3
         brkfrq = 1000.0
         brkpt = (brkfrq - f0) / fsp
-        logstep = exp(log(6.4) / 27)
-        linpts = f .< brkfrq
-        z = zeros(size(f))      # prevent InexactError() by making these Float64
-        z[findall(linpts)] = f[findall(linpts)]/brkfrq ./ log(logstep)
-        z[findall(.!linpts)] = brkpt .+ log.(f[findall(.!linpts)] / brkfrq) ./ log(logstep)
+        logstep = log(6.4) / 27
+        linpt = f < brkfrq
+        z = linpt ? f / brkfrq / logstep : brkpt + log(f / brkfrq) / logstep
     end
     return z
 end
-hz2mel(f::AbstractFloat, htk=false)  = hz2mel([f], htk)[1]
 
-function mel2hz(z::Vector{T}, htk=false) where {T<:AbstractFloat}
+function mel2hz(z::AbstractFloat, htk::Bool=false)
     if htk
-        f = 700 .* (10 .^ (z ./ 2595) .- 1)
+        f = 700 * (exp10(z / 2595) - 1)
     else
         f0 = 0.0
         fsp = 200 / 3
         brkfrq = 1000.0
         brkpt = (brkfrq - f0) / fsp
-        logstep = exp(log(6.4) / 27)
-        linpts = z .< brkpt
-        f = similar(z)
-        f[linpts] = f0 .+ fsp * z[linpts]
-        f[.!linpts] = brkfrq .* exp.(log.(logstep) * (z[.!linpts] .- brkpt))
+        logstep = log(6.4) / 27
+        linpt = z < brkpt
+        f = linpt ? f0 + fsp * z : brkfrq * exp(logstep * (z - brkpt))
     end
     return f
 end
 
-function postaud(x::Matrix{T}, fmax::Real, fbtype=:bark, broaden=false) where {T<:AbstractFloat}
-    (nbands,nframes) = size(x)
+"""
+Hynek's magic equal-loudness-curve formula
+"""
+function hynek_eql(bandcfhz)
+    fsq = bandcfhz^2
+    ftmp = fsq + 1.6e5
+    eql = ((fsq / ftmp)^2) * ((fsq + 1.44e6) / (fsq + 9.61e6))
+    eql
+end
+
+function postaud(x::AbstractMatrix{<:AbstractFloat}, fmax::Real, fbtype=:bark, broaden::Bool=false)
+    nbands, nframes = size(x)
     nfpts = nbands + 2broaden
     if fbtype == :bark
-        bandcfhz = bark2hz(range(0, stop=hz2bark(fmax), length=nfpts))
+        bandcfhz = bark2hz.(range(0, stop=hz2bark(fmax), length=nfpts))
     elseif fbtype == :mel
-        bandcfhz = mel2hz(range(0, stop=hz2mel(fmax), length=nfpts))
-    elseif fbtype == :htkmel || fbtype == :fcmel
-        bandcfhz = mel2hz(range(0, stop=hz2mel(fmax,1), length=nfpts),1);
+        bandcfhz = mel2hz.(range(0, stop=hz2mel(fmax), length=nfpts))
+    elseif fbtype in (:htkmel, :fcmel)
+        bandcfhz = mel2hz.(range(0, stop=hz2mel(fmax, true), length=nfpts), true);
     else
-        error("Unknown filterbank type")
+        throw(ArgumentError(string("Unknown filterbank type: ", fbtype)))
     end
     # Remove extremal bands (the ones that will be duplicated)
-    bandcfhz = bandcfhz[1+broaden:nfpts-broaden];
-    # Hynek's magic equal-loudness-curve formula
-    fsq = bandcfhz.^2
-    ftmp = fsq + 1.6e5
-    eql = ((fsq ./ ftmp).^2) .* ((fsq + 1.44e6) ./ (fsq + 9.61e6))
+    keepat!(bandcfhz, 1+broaden:nfpts-broaden)
+
     # weight the critical bands
-    z = broadcast(*, eql, x)
+    eql = hynek_eql.(bandcfhz)
     # cube root compress
-    z .^= 0.33
+    z = @. cbrt(eql * x)
+
     # replicate first and last band (because they are unreliable as calculated)
     if broaden
-        z = z[[1, 1:nbands, nbands], :];
+        z = z[[begin; begin:end; end], :];
     else
-        z = z[[2, 2:(nbands-1), nbands-1], :]
+        @views z[[begin, end], :] = z[[begin+1, end-1], :]
     end
     return z
 end
 
-function dolpc(x::Array{T}, modelorder::Int=8) where {T<:AbstractFloat}
+function dolpc(x::AbstractMatrix{<:AbstractFloat}, modelorder::Int=8)
     nbands, nframes = size(x)
-    r = real(ifft(vcat(x, x[collect(nbands-1:-1:2), :]), 1)[1:nbands, :])
+    r = FFTW.r2r(x, FFTW.REDFT00, 1)
+    r ./= 2(nbands - 1)
     # Find LPC coeffs by durbin
     y, e = levinson(r, modelorder)
     # Normalize each poly by gain
     y ./= e
 end
 
-function lpc2cep(a::Array{T}, ncep::Int=0) where {T<:AbstractFloat}
+@views function lpc2cep(a::AbstractMatrix{T}, ncep::Int=0) where {T<:AbstractFloat}
     nlpc, nc = size(a)
     order = nlpc - 1
-    if ncep == 0
+    if iszero(ncep)
         ncep = nlpc
     end
-    c = zeros(ncep, nc)
+    c = zeros(nc, ncep)
+    a = copy(a')
+    sum_var = collect(T, a[:, begin])
     # Code copied from HSigP.c: LPC2Cepstrum
     # First cep is log(Error) from Durbin
-    c[1,:] = -log.(a[1, :])
+    @. c[:, begin] = -log(sum_var)
     # Renormalize lpc A coeffs
-    a ./= a[1, :]
-    for n in 2:ncep
-        sum = zero(T)
-        for m in 2:n
-            sum += (n - m) * a[m, :] .* c[n - m + 1, :]
+    @. a /= sum_var
+    for i in 2:ncep
+        fill!(sum_var, zero(T))
+        for m in 2:i-1
+            @. sum_var += (i - m) * a[:, m] * c[:, i - m + 1]
         end
-        c[n, :] = -a[n, :] - sum / (n - 1)
+        @. c[:, i] = -a[:, i] - sum_var / (i - 1)
     end
-    return c
+    return c'
 end
 
-function spec2cep(spec::Array{T}, ncep::Int=13, dcttype::Int=2) where {T<:AbstractFloat}
-    # no discrete cosine transform option
-    dcttype == -1 && return log(spec)
-
-    nr, nc = size(spec)
-    dctm = similar(spec, ncep, nr)
+@memoize function dct_matrix(dcttype::Int, ncep::Int, nr::Int, ::Type{T}) where T
+    dctm = Matrix{T}(undef, ncep, nr)
     if 1 < dcttype < 4          # type 2,3
-        for i in 1:ncep
-            dctm[i, :] = cos.((i - 1) * collect(1:2:2nr-1)π / (2nr)) * √(2/nr)
+        for j in 1:nr, i in 1:ncep
+            dctm[i, j] = cospi((i-1) * (2j-1) / (2nr)) * √(2 / nr)
         end
         if dcttype == 2
-            dctm[1, :] ./= √2
+            @. dctm[1, :] /= √2
         end
-    elseif dcttype == 4           # type 4
-        for i in 1:ncep
-            dctm[i, :] = 2cos.((i-1) * collect(1:nr)π/(nr+1))
-            dctm[i, 1] += 1
-            dctm[i, nr] += (-1)^(i-1)
+    elseif dcttype == 4         # type 4
+        for j in 1:nr, i in 1:ncep
+            dctm[i, j] = 2cospi((i-1) * j / (nr + 1))
         end
-        dctm /= 2(nr + 1)
-    else                        # type 1
-        for i in 1:ncep
-            dctm[i, :] = cos.((i-1) * collect(0:nr-1)π ./ (nr - 1)) ./ (nr - 1)
+        for i in axes(dctm, 1)
+            dctm[i, end] += (-1)^(i-1)
         end
-        dctm[:, [1, nr]] /= 2
+        @. dctm[:, 1] += 1
+        @. dctm /= 2(nr + 1)
+    elseif dcttype == 1         # type 1
+        for j in 1:nr, i in 1:ncep
+            dctm[i, j] = cospi((i-1) * (j-1) / (nr - 1)) / (nr - 1)
+        end
+        @. dctm[:, [1, nr]] /= 2
+    else
+        throw(DomainError(dcttype, "DCT type must be an integer from 1 to 4"))
     end
-    return dctm * log.(spec)
+    dctm
 end
 
-function lifter(x::Array{T}, lift::Real=0.6, invs=false) where {T<:AbstractFloat}
-    (ncep, nf) = size(x)
-    if lift == 0
+function spec2cep(spec::AbstractMatrix{T}, ncep::Int=13, dcttype::Int=2) where {T<:AbstractFloat}
+    # no discrete cosine transform option
+    dcttype == -1 && return map!(log, spec, spec)
+    nr, nc = size(spec)
+    dctm = dct_matrix(dcttype, ncep, nr, T)
+    # assume spec is not reused
+    return dctm * map!(log, spec, spec)
+end
+
+function lifter(x::AbstractArray{<:AbstractFloat}, lift::Real=0.6, invs::Bool=false)
+    ncep = nrow(x)
+    if iszero(lift)
         return x
-    end
-    if lift > 0
+    elseif lift > 0
         if lift > 10
-            error("Too high lift number")
+            throw(DomainError(lift, "Lift number is too high (>10)"))
         end
-        liftw = [1; collect(1:ncep-1).^lift]
+        liftw = pushfirst!((1:ncep-1).^lift, 1)
     else
         # Hack to support HTK liftering
         if !isa(lift, Integer)
-            error("Negative lift must be interger")
+            throw(DomainError(lift, "Negative lift must be integer"))
         end
         lift = -lift            # strictly speaking unnecessary...
-        liftw = vcat(1, (1 .+ lift/2 * sin.(collect(1:ncep-1)π / lift)))
+        liftw = @. 1 + lift / 2 * sinpi((0:ncep-1) / lift)
     end
     if invs
-        liftw = 1 ./ liftw
+        @. liftw = inv(liftw)
     end
-    y = broadcast(*, x, liftw)
+    y = broadcast(*, x', liftw')
     return y
 end
 
 ## Freely after octave's implementation, by Paul Kienzle <pkienzle@users.sf.net>
-## Permission granted to usee this in a MIT license on 20 dec 2013 by the author Paul Kienzle:
+## Permission granted to use this in a MIT license on 20 dec 2013 by the author Paul Kienzle:
 ## "You are welcome to move my octave code from GPL to MIT like core Julia."
 ## untested
 ## only returns a, v
-function levinson(acf::Vector{T}, p::Int) where {T<:Real}
-    if length(acf) < 1
-        error("empty autocorrelation function")
-    end
-    if p < 0
-        error("negative model order")
-    end
-    if p < 100
-        ## direct solution [O(p^3), but no loops so slightly faster for small p]
-        ## Kay & Marple Eqn (2.39)
-        R = toeplitz(acf[1:p], conj(acf[1:p]))
-        a = R \ -acf[2:p+1]
-        pushfirst!(a, 1)
-        v = real(a.*conj(acf[1:p+1]))
+function levinson(acf::AbstractVector{<:Number}, p::Int)
+    if isempty(acf)
+        throw(ArgumentError("Empty autocorrelation function"))
+    elseif p < 0
+        throw(DomainError(p, "Negative model order"))
     else
-        ## durbin-levinson [O(p^2), so significantly faster for large p]
-        ## Kay & Marple Eqns (2.42-2.46)
-        ref = zeros(p)
-        g = -acf[2] / acf[1]
-        a = [g]
-        v = real((1 - abs2(g)) * acf[1])
-        ref[1] = g
-        for t=2:p
-            g = -(acf[t+1] + a ⋅ acf[t:-1:2]) / v
-            a = [a + g * conj(a[t-1:-1:1]), g]
-            v *= 1 - abs2(g)
-            ref[t] = g
-        end
-        pushfirst!(a, 1)
+        a, v = _durbin_levinson(acf, p)
     end
-    return (a, v)
+    return a, v
 end
 
-function levinson(acf::Array{T}, p::Int) where {T<:Real}
-    (nr,nc) = size(acf)
+"""
+Durbin-Levinson [O(p^2), so significantly faster for large p]
+## Kay & Marple Eqns (2.42-2.46)
+"""
+@views function _durbin_levinson(acf::AbstractVector{<:Number}, p::Int)
+    g = -acf[begin+1] / acf[begin]
+    a = zeros(p + 1); a[1] = 1; a[2] = g
+    buf = similar(a)
+    v = real((1 - abs2(g)) * acf[begin])
+    # ref[begin] = g
+    for t in 2:p
+        g = -(acf[begin+t] + simple_dot(a[2:t], acf[begin+t-1:-1:begin+1])) / v
+        @. buf[2:t] = g * conj(a[t:-1:2])
+        @. a[2:t] += buf[2:t]
+        a[t+1] = g
+        v *= 1 - abs2(g)
+        # ref[t] = g
+    end
+    a, v
+end
+
+# for 1.6 compat (BLAS negative stride views bug)
+function simple_dot(x::AbstractVector{T}, y::AbstractVector{V}) where {T,V}
+    val = zero(promote_type(T, V))
+    for i in eachindex(x, y)
+        val += x[i] * y[i]
+    end
+    val
+end
+
+function levinson(acf::AbstractMatrix{<:Number}, p::Integer)
+    nr, nc = size(acf)
     a = zeros(p + 1, nc)
-    v = zeros(p + 1, nc)
-    for i in 1:nc
-        a[:,i], v[:,i] = levinson(acf[:,i], p)
+    v = zeros(1, nc)
+    for i in axes(acf, 2)
+        a_i, v_i = levinson(view(acf, :, i), p)
+        a[:, i] = a_i
+        v[i] = v_i
     end
-    return (a, v)
-end
-
-## Freely after octave's implementation, ver 3.2.4, by jwe && jh
-## skipped sparse implementation
-function toeplitz(c::Vector{T}, r::Vector{T}=c) where {T<:Real}
-    nc = length(r)
-    nr = length(c)
-    res = zeros(typeof(c[1]), nr, nc)
-    if nc == 0 || nr == 0
-        return res
-    end
-    if r[1] != c[1]
-        ## warn
-    end
-    if typeof(c) <: Complex
-        conj!(c)
-        c[1] = conj(c[1])       # bug in julia?
-    end
-    ## if issparse(c) && ispsparse(r)
-    data = [r[end:-1:2], c]
-    for (i, start) in zip(1:nc, nc:-1:1)
-        res[:,i] = data[start:start+nr-1]
-    end
-    return res
+    return a, v
 end
